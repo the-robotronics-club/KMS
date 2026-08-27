@@ -1,0 +1,450 @@
+KMS ESP System Report
+
+Project: KMS (Cabinet Management System) — ESP32 captive-portal + secure UART relay
+Path: docs/KMS_ESP_report.pdf
+
+Hardware overview
+- Two ESP32 microcontroller boards.
+  - Cabinet ESP: creates a Wi-Fi access point (SoftAP) that serves the KMS web UI to any connected user (captive portal behavior).
+  - Electronics ESP: connected to the cabinet ESP via UART (RX/TX) and receives encrypted action messages to operate relays or other electronics.
+
+User flow
+- A user connects their phone/computer to the cabinet ESP Wi-Fi SSID (e.g., "ESP-KMS-XXXXX").
+- Opening the browser redirects them to the local KMS website (captive portal). They log in and press action buttons (for example: "Open Cabinet").
+- The cabinet ESP encrypts the action and sends it to the electronics ESP over UART.
+- The electronics ESP verifies and decrypts the message, and then triggers connected hardware (e.g., unlocks a cabinet).
+
+Security overview
+- Wi-Fi network is protected with WPA2 and a strong password.
+- Action messages are encrypted using AES-CTR and authenticated with HMAC-SHA256.
+- Each device should have its own unique 32-byte shared key.
+
+2. Files included
+
+A) Cabinet ESP (SoftAP + captive portal + encrypt & send over UART)
+
+--- cabinet_esp.ino ---
+
+/* Cabinet ESP32 sketch
+   - Creates WPA2 SoftAP
+   - DNSServer redirects all DNS to the device (captive portal)
+   - AsyncWebServer serves local KMS web UI from LittleFS
+   - Provides /api/login (POST) -> returns session token
+   - Provides /api/action (POST) -> requires session token header; encrypts+HMACs payload and sends to Serial1 (TX/RX wiring to electronics ESP)
+   - Uses AES-CTR + HMAC-SHA256 via mbedTLS (available in ESP32 Arduino core)
+*/
+
+#include <WiFi.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include <DNSServer.h>
+#include "LittleFS.h"
+#include "mbedtls/aes.h"
+#include "mbedtls/md.h"
+
+#define AP_SSID_PREFIX "ESP-KMS-"
+#define AP_PASSWORD "ReplaceWithStrongPassword!" // WPA2 password (change)
+#define DNS_PORT 53
+#define HTTP_PORT 80
+
+// UART for transmitting to electronics ESP
+#define UART_TX_PIN 17
+#define UART_RX_PIN 16
+#define UART_BAUD 115200
+
+// Security: 32-byte shared key (use unique per-device!)
+const uint8_t SHARED_KEY[32] = {
+  // Replace these bytes with a secure random key per device
+  0x12,0x34,0x56,0x78,0x9a,0xbc,0xde,0xf0,
+  0x01,0x23,0x45,0x67,0x89,0xab,0xcd,0xef,
+  0x10,0x32,0x54,0x76,0x98,0xba,0xdc,0xfe,
+  0xaa,0xbb,0xcc,0xdd,0xee,0xff,0x11,0x22
+};
+
+// Server objects
+DNSServer dnsServer;
+AsyncWebServer server(HTTP_PORT);
+
+// Simple in-memory session storage
+String currentSessionToken = "";
+uint32_t sessionExpiry = 0; // epoch millis
+
+// Utility: random token
+String genToken(size_t len=32) {
+  static const char *chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+  String s;
+  s.reserve(len);
+  for (size_t i=0;i<len;i++) s += chars[esp_random() % 62];
+  return s;
+}
+
+// Cryptography: AES-CTR encryption and HMAC-SHA256
+// Encrypt plaintext -> ciphertext (same length), produce HMAC over (nonce||ciphertext)
+bool aes_ctr_encrypt_and_hmac(const uint8_t *key32, const uint8_t *plaintext, size_t plen,
+                              uint8_t *nonce16, uint8_t *ciphertext, uint8_t *mac32) {
+  // nonce16: output 16 bytes (we will use 16 bytes)
+  uint32_t r;
+  for (int i=0;i<4;i++){ ((uint32_t*)nonce16)[i] = esp_random(); } // fill 16 bytes with random
+  // AES-CTR using first 16 bytes of key as AES key (use key34? We'll use 16 bytes AES-128)
+  mbedtls_aes_context aes;
+  mbedtls_aes_init(&aes);
+  int ret = mbedtls_aes_setkey_enc(&aes, key32, 128); // AES-128 using first 16 bytes
+  if (ret != 0) { mbedtls_aes_free(&aes); return false; }
+  unsigned char stream_block[16];
+  unsigned char nonce_counter[16];
+  memcpy(nonce_counter, nonce16, 16);
+  unsigned int nc_off = 0;
+  ret = mbedtls_aes_crypt_ctr(&aes, plen, &nc_off, nonce_counter, stream_block, plaintext, ciphertext);
+  mbedtls_aes_free(&aes);
+  if (ret != 0) return false;
+  // HMAC-SHA256 over (nonce||ciphertext)
+  mbedtls_md_context_t ctx;
+  const mbedtls_md_info_t *info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+  mbedtls_md_init(&ctx);
+  if (mbedtls_md_setup(&ctx, info, 1) != 0) { mbedtls_md_free(&ctx); return false; }
+  if (mbedtls_md_hmac_starts(&ctx, key32, 32) != 0) { mbedtls_md_free(&ctx); return false; }
+  if (mbedtls_md_hmac_update(&ctx, nonce16, 16) != 0) { mbedtls_md_free(&ctx); return false; }
+  if (mbedtls_md_hmac_update(&ctx, ciphertext, plen) != 0) { mbedtls_md_free(&ctx); return false; }
+  if (mbedtls_md_hmac_finish(&ctx, mac32) != 0) { mbedtls_md_free(&ctx); return false; }
+  mbedtls_md_free(&ctx);
+  return true;
+}
+
+// UART framed send: [0xAA][0x55][len_hi][len_lo][nonce(16)][ciphertext][mac(32)]
+void uart_send_frame(const uint8_t *payload, size_t payload_len) {
+  // Prepare buffer for ciphertext and mac
+  uint8_t nonce[16];
+  uint8_t *ciphertext = (uint8_t*)malloc(payload_len);
+  uint8_t mac[32];
+  if (!aes_ctr_encrypt_and_hmac(SHARED_KEY, payload, payload_len, nonce, ciphertext, mac)) {
+    Serial.println("Encryption failed");
+    free(ciphertext);
+    return;
+  }
+  uint16_t totalPayloadLen = 16 + payload_len + 32; // nonce + ciphertext + mac
+  // Frame header
+  Serial1.write(0xAA);
+  Serial1.write(0x55);
+  Serial1.write((totalPayloadLen >> 8) & 0xFF);
+  Serial1.write(totalPayloadLen & 0xFF);
+  // nonce
+  Serial1.write(nonce, 16);
+  // ciphertext
+  Serial1.write(ciphertext, payload_len);
+  // mac
+  Serial1.write(mac, 32);
+  free(ciphertext);
+}
+
+// Helper: require session token in header "X-Session-Token"
+bool checkSession(AsyncWebServerRequest *request) {
+  if (!request->hasHeader("X-Session-Token")) return false;
+  String token = request->header("X-Session-Token")->value();
+  if (token != currentSessionToken) return false;
+  if (millis() > sessionExpiry) return false;
+  return true;
+}
+
+void setup() {
+  Serial.begin(115200);
+  // UART1 for transmit to electronics ESP
+  Serial1.begin(UART_BAUD, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
+
+  if(!LittleFS.begin()){
+    Serial.println("LittleFS mount failed");
+  }
+
+  // Build AP SSID with chip ID
+  String chip = String((uint32_t)ESP.getEfuseMac(), HEX);
+  String apSsid = String(AP_SSID_PREFIX) + chip.substring(chip.length()-6);
+  WiFi.mode(WIFI_AP);
+  bool ok = WiFi.softAP(apSsid.c_str(), AP_PASSWORD);
+  IPAddress apIP = WiFi.softAPIP();
+  Serial.printf("Started AP %s, IP: %s\n", apSsid.c_str(), apIP.toString().c_str());
+
+  // Setup DNSServer to redirect all domains to AP IP
+  dnsServer.start(DNS_PORT, "*", apIP);
+
+  // Routes
+  // Serve static files from LittleFS (put index.html etc into LittleFS)
+  server.serveStatic("/", LittleFS, "/").setDefaultFile("index.html");
+
+  // Login API (POST JSON {password: "..."}), returns JSON {token:"..."}
+  server.on("/api/login", HTTP_POST, [](AsyncWebServerRequest *request){
+    if (request->hasParam("plain", true)) {
+      String body = request->getParam("plain", true)->value();
+      // For demo: accept a single password stored in code; in prod store hashed password
+      const String expectedPass = "kmsadminpw"; // change
+      if (body.indexOf(expectedPass) != -1) {
+        currentSessionToken = genToken(40);
+        sessionExpiry = millis() + (30 * 60 * 1000); // 30 minutes
+        String resp = "{\"token\":\"" + currentSessionToken + "\"}";
+        request->send(200, "application/json", resp);
+        return;
+      }
+    }
+    request->send(401, "application/json", "{\"error\":\"invalid\"}");
+  });
+
+  // Action API (POST JSON) requires session token header
+  server.on("/api/action", HTTP_POST, [](AsyncWebServerRequest *request){
+    if (!checkSession(request)) {
+      request->send(403, "application/json", "{\"error\":\"auth\"}");
+      return;
+    }
+    if (request->hasParam("plain", true)) {
+      String body = request->getParam("plain", true)->value();
+      // Convert String body to bytes and send over UART encrypted
+      uart_send_frame((const uint8_t*)body.c_str(), body.length());
+      request->send(200, "application/json", "{\"status\":\"sent\"}");
+      return;
+    }
+    request->send(400, "application/json", "{\"error\":\"no_body\"}");
+  });
+
+  // Catch-all to serve captive portal page
+  server.onNotFound([](AsyncWebServerRequest *request){
+    // redirect everything to root index.html
+    AsyncWebServerResponse *response = request->beginResponse(LittleFS, "/index.html", "text/html");
+    response->addHeader("Cache-Control","no-cache, no-store, must-revalidate");
+    request->send(response);
+  });
+
+  server.begin();
+  Serial.println("Web server started");
+}
+
+void loop() {
+  dnsServer.processNextRequest();
+  // keep sessions valid (nothing else here)
+}
+
+
+B) Electronics ESP (UART receive, verify HMAC, decrypt, act)
+
+--- electronics_esp.ino ---
+
+/* Electronics ESP32 sketch
+   - Listens on Serial1 for framed encrypted messages from cabinet ESP
+   - Frame: 0xAA 0x55 len_hi len_lo [nonce16][ciphertext][mac32]
+   - Verifies HMAC-SHA256 and decrypts AES-CTR then prints payload (hook electronics control here)
+*/
+
+#include <Arduino.h>
+#include "mbedtls/aes.h"
+#include "mbedtls/md.h"
+
+#define UART_RX_PIN 16
+#define UART_TX_PIN 17
+#define UART_BAUD 115200
+
+const uint8_t SHARED_KEY[32] = {
+  // MUST match the cabinet ESP key exactly
+  0x12,0x34,0x56,0x78,0x9a,0xbc,0xde,0xf0,
+  0x01,0x23,0x45,0x67,0x89,0xab,0xcd,0xef,
+  0x10,0x32,0x54,0x76,0x98,0xba,0xdc,0xfe,
+  0xaa,0xbb,0xcc,0xdd,0xee,0xff,0x11,0x22
+};
+
+void setup() {
+  Serial.begin(115200);
+  Serial1.begin(UART_BAUD, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
+  Serial.println("Electronics ESP ready");
+}
+
+bool aes_ctr_decrypt_and_verify(const uint8_t *key32, const uint8_t *nonce16, const uint8_t *ciphertext, size_t clen,
+                                const uint8_t *mac32, uint8_t *out_plain) {
+  // Verify HMAC-SHA256
+  mbedtls_md_context_t ctx;
+  const mbedtls_md_info_t *info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+  mbedtls_md_init(&ctx);
+  if (mbedtls_md_setup(&ctx, info, 1) != 0) { mbedtls_md_free(&ctx); return false; }
+  if (mbedtls_md_hmac_starts(&ctx, key32, 32) != 0) { mbedtls_md_free(&ctx); return false; }
+  if (mbedtls_md_hmac_update(&ctx, nonce16, 16) != 0) { mbedtls_md_free(&ctx); return false; }
+  if (mbedtls_md_hmac_update(&ctx, ciphertext, clen) != 0) { mbedtls_md_free(&ctx); return false; }
+  uint8_t calc_mac[32];
+  if (mbedtls_md_hmac_finish(&ctx, calc_mac) != 0) { mbedtls_md_free(&ctx); return false; }
+  mbedtls_md_free(&ctx);
+  if (memcmp(calc_mac, mac32, 32) != 0) {
+    Serial.println("HMAC mismatch");
+    return false;
+  }
+  // AES-CTR decrypt (same as encrypt)
+  mbedtls_aes_context aes;
+  mbedtls_aes_init(&aes);
+  if (mbedtls_aes_setkey_enc(&aes, key32, 128) != 0) { mbedtls_aes_free(&aes); return false; }
+  unsigned char stream_block[16];
+  unsigned char nonce_counter[16];
+  memcpy(nonce_counter, nonce16, 16);
+  unsigned int nc_off = 0;
+  if (mbedtls_aes_crypt_ctr(&aes, clen, &nc_off, nonce_counter, stream_block, ciphertext, out_plain) != 0) {
+    mbedtls_aes_free(&aes); return false; }
+  mbedtls_aes_free(&aes);
+  return true;
+}
+
+void processFrame(const uint8_t *frame, size_t len) {
+  // frame contains [nonce(16)][ciphertext(len-48)][mac(32)] and total len = 16 + c + 32
+  if (len < (16+32)) return;
+  size_t clen = len - 16 - 32;
+  const uint8_t *nonce = frame;
+  const uint8_t *ciphertext = frame + 16;
+  const uint8_t *mac = frame + 16 + clen;
+  uint8_t *plain = (uint8_t*)malloc(clen+1);
+  if (!aes_ctr_decrypt_and_verify(SHARED_KEY, nonce, ciphertext, clen, mac, plain)) {
+    free(plain);
+    return;
+  }
+  plain[clen] = 0;
+  Serial.print("Received action payload: ");
+  Serial.println((char*)plain);
+  // TODO: parse JSON and actuate electronics here
+  free(plain);
+}
+
+void loop() {
+  static enum {WAIT_SYNC1, WAIT_SYNC2, READ_LEN_HI, READ_LEN_LO, READ_PAYLOAD} state = WAIT_SYNC1;
+  static uint16_t payloadLen = 0;
+  static uint8_t *buf = nullptr;
+  static size_t bufPos = 0;
+
+  while (Serial1.available()) {
+    uint8_t b = Serial1.read();
+    if (state == WAIT_SYNC1) {
+      if (b == 0xAA) state = WAIT_SYNC2;
+    } else if (state == WAIT_SYNC2) {
+      if (b == 0x55) state = READ_LEN_HI;
+      else state = WAIT_SYNC1;
+    } else if (state == READ_LEN_HI) {
+      payloadLen = ((uint16_t)b) << 8;
+      state = READ_LEN_LO;
+    } else if (state == READ_LEN_LO) {
+      payloadLen |= b;
+      if (payloadLen > 4096) { // sanity
+        state = WAIT_SYNC1;
+      } else {
+        buf = (uint8_t*)malloc(payloadLen);
+        bufPos = 0;
+        state = READ_PAYLOAD;
+      }
+    } else if (state == READ_PAYLOAD) {
+      buf[bufPos++] = b;
+      if (bufPos >= payloadLen) {
+        // process frame
+        processFrame(buf, payloadLen);
+        free(buf);
+        buf = nullptr;
+        state = WAIT_SYNC1;
+      }
+    }
+  }
+}
+
+
+C) Sample web UI (index.html + app.js) for LittleFS (small test client)
+
+--- index.html ---
+
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>KMS Portal</title>
+</head>
+<body>
+  <h1>KMS Portal</h1>
+  <div id="login">
+    <input id="pw" type="password" placeholder="admin password" />
+    <button id="btnLogin">Login</button>
+  </div>
+  <div id="actions" style="display:none;">
+    <button id="btnOpen">Open Cabinet</button>
+    <button id="btnClose">Close Cabinet</button>
+  </div>
+  <pre id="out"></pre>
+  <script src="/app.js"></script>
+</body>
+</html>
+
+--- app.js ---
+
+async function postJSON(url, obj, token) {
+  const res = await fetch(url, {method:'POST', body: JSON.stringify(obj), headers: token ? {'X-Session-Token': token, 'Content-Type':'application/json'} : {'Content-Type':'application/json'}});
+  return res.json().catch(()=>({}));
+}
+
+let token = null;
+
+document.getElementById('btnLogin').addEventListener('click', async ()=>{
+  const pw = document.getElementById('pw').value;
+  const r = await postJSON('/api/login', {password: pw});
+  if (r.token) { token = r.token; document.getElementById('login').style.display='none'; document.getElementById('actions').style.display='block'; log('Logged in'); }
+  else log('Login failed');
+});
+
+document.getElementById('btnOpen').addEventListener('click', async ()=>{
+  if (!token) return log('Not logged in');
+  const r = await postJSON('/api/action', {action:'open'}, token);
+  log('Action sent: '+JSON.stringify(r));
+});
+
+document.getElementById('btnClose').addEventListener('click', async ()=>{
+  if (!token) return log('Not logged in');
+  const r = await postJSON('/api/action', {action:'close'}, token);
+  log('Action sent: '+JSON.stringify(r));
+});
+
+function log(s){ document.getElementById('out').textContent += s + "\n"; }
+
+
+3. How to deploy
+
+Prerequisites
+- Two ESP32 boards
+- USB cable and a computer with Arduino IDE or PlatformIO
+- ESP32 board support installed in Arduino IDE or PlatformIO
+- LittleFS uploader plugin (Arduino) or PlatformIO filesystem upload
+- Wires for UART (TX->RX) and common ground
+
+Edit configuration in code
+- Replace AP_PASSWORD with a strong WPA2 password in cabinet_esp.ino
+- Replace SHARED_KEY (32 bytes) in both sketches with a secure random key (must match on both devices)
+- Replace expectedPass in cabinet sketch or implement hashed-check
+- Adjust UART pins if needed
+
+Upload web files to LittleFS (cabinet ESP)
+- Put index.html and app.js into the LittleFS root and upload using LittleFS tool
+
+Flash sketches
+- Select correct ESP32 board and COM port in Arduino IDE
+- Upload cabinet_esp.ino to the cabinet board
+- Upload electronics_esp.ino to the electronics board
+
+Wiring
+- Connect cabinet Serial1 TX pin (as defined in sketch) to electronics RX pin
+- Optionally connect electronics TX to cabinet RX for bi-directional comms
+- Connect ground between both boards
+
+Test flow
+- Connect phone to Wi-Fi SSID ESP-KMS-xxxx
+- Open browser; captive portal should redirect to index.html
+- Login and press action buttons
+- Monitor Serial on electronics ESP to see decrypted payloads
+
+4. Troubleshooting
+- Captive portal not appearing: open http://192.168.4.1 directly
+- HMAC mismatch: verify SHARED_KEY bytes match exactly on both boards
+- UART frames not arriving: verify TX/RX wiring and matching baud
+- LittleFS not serving files: verify LittleFS upload successful and index.html present
+
+5. Security checklist (must-do)
+- Unique keys per device; provision securely
+- Strong WPA2 password for SoftAP
+- Session tokens and short expiry
+- Signed firmware updates if possible
+- Consider a gateway for TLS if you need browser-trusted HTTPS
+
+6. Next steps & notes
+- For production, move to a more robust authentication system, key provisioning, and secure OTA.
+- Consider ESP-NOW or MQTT-over-TLS if you need scalable networking instead of direct UART.

@@ -1,0 +1,143 @@
+# Local development stack. Everything runs in containers:
+#
+#   docker compose up --build
+#
+# then open http://localhost:3000 and log in as demo@iitmandi.ac.in / Demo@1234,
+# TOTP code 000000. No .env to copy, no pip, no npm — a fresh clone works as is.
+#
+# Every value below is a throwaway local default. Nothing here is a secret and
+# nothing here is safe to deploy: DEBUG is on, the TOTP bypass is armed, and the
+# Postgres password is "postgres". See docker-compose.prod.yml for a real stack.
+#
+# To supply real credentials (SMTP, for example) without editing this file, drop
+# them in backend/.env — it is loaded when present and ignored when absent. The
+# `environment:` block below still wins for the service addresses, so a .env
+# written for a host-run uvicorn keeps working here.
+
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2
+    ports:
+      # 1883 stays on all interfaces: ESP32 enclosures dial in from the LAN.
+      - "1883:1883"
+      - "127.0.0.1:9001:9001"
+    volumes:
+      - ./mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    # Bound to loopback so a laptop on campus wifi isn't serving an open Redis.
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    ports:
+      - "127.0.0.1:5432:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: skss
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d skss"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    env_file:
+      # Optional overlay for real credentials. Absent on a fresh clone.
+      - path: ./backend/.env
+        required: false
+    environment:
+      # Service names, not localhost — inside a container localhost is the
+      # container itself, so the host-oriented values in backend/.env would
+      # point every connection back at uvicorn.
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/skss
+      REDIS_URL: redis://redis:6379/0
+      MQTT_HOST: mosquitto
+      MQTT_PORT: "1883"
+      MQTT_TLS: "false"
+      # The broker is up, but nothing publishes proximity codes without a real
+      # enclosure. Flip to true when you have one on the LAN.
+      MQTT_ENABLED: "true"
+      ALLOWED_ORIGINS: http://localhost:3000
+      # Enables /docs. Local only — it also loosens error detail.
+      DEBUG: "true"
+      # Accepts 000000 as a valid TOTP code for every user. The startup
+      # validator refuses to boot with this set unless DEBUG is true.
+      TOTP_DEMO_BYPASS_CODE: "000000"
+      # Dev-only throwaway Fernet key for users.totp_secret; what it encrypts
+      # lives in the throwaway postgres volume. Generate a real one for any
+      # deploy: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+      TOTP_ENCRYPTION_KEY: "T5tqJR6rNSF7kzK0vYtBlRfqO4hdH8c2m1wQpAe9u4Y="
+      # Prints mail to the container log instead of needing SMTP credentials.
+      EMAIL_PROVIDER: console
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      mosquitto:
+        condition: service_started
+    volumes:
+      - ./backend:/app
+    # Migrate, then seed, then serve. seed.py is idempotent, so this is safe on
+    # every boot and means a fresh clone comes up with demo users already in it.
+    # The image's own CMD stays seed-free for production.
+    command: sh -c "alembic upgrade head && python seed.py && exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
+    healthcheck:
+      # No curl in python:slim, and adding it just for this is not worth a layer.
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      # Migrations plus seed on a cold volume take longer than one interval.
+      start_period: 40s
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      # The default target is the production runner: standalone bundle only, no
+      # node_modules, so `npm run dev` cannot run there.
+      target: dev
+    ports:
+      - "3000:3000"
+    environment:
+      # The /api/* rewrite runs server-side, inside this container, so it needs
+      # the compose network name. localhost here would be the frontend itself.
+      INTERNAL_API_URL: http://backend:8000
+      # Used only to build the ws:// origin for /ws/keys, which the browser
+      # opens directly against the backend. That is a host-side URL.
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+      NEXT_PUBLIC_DEMO_MODE: "true"
+      NEXT_PUBLIC_DEMO_EMAIL: demo@iitmandi.ac.in
+    depends_on:
+      backend:
+        condition: service_healthy
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+      - /app/.next
+    command: npm run dev
+    restart: unless-stopped
+
+volumes:
+  postgres_data:

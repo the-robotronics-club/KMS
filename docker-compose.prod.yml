@@ -1,0 +1,109 @@
+# Production topology.
+#
+#   docker compose -f docker-compose.prod.yml build
+#   docker compose -f docker-compose.prod.yml up -d
+#
+# docker-compose.yml (dev) bind-mounts ./frontend and ./backend over /app and runs
+# `npm run dev` / `uvicorn --reload`. That throws away the built image layers, which
+# is right for hot reload and wrong for a deploy. Nothing here mounts source.
+#
+# Postgres and Redis publish no host ports — only the compose network reaches them.
+# Mosquitto keeps 1883 because ESP32 enclosures dial in from the campus LAN.
+#
+# Requires a .env beside this file with POSTGRES_USER and POSTGRES_PASSWORD
+# set. MQTT_USERNAME / MQTT_PASSWORD / MQTT_DEVICE_PASSWORD are also required
+# once enclosures go live: the broker service below generates its password
+# file from them at boot, and the backend connects with the same pair.
+
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2
+    ports:
+      - "1883:1883"
+    env_file:
+      - ./backend/.env
+    # Password file is built in-container from the env pair, so no hash is
+    # ever written to git. The second -b adds the shared device password the
+    # ESP32 enclosures use (firmware config.h MQTT_USERNAME=kms-device).
+    # Fails loud at boot if the env pairs are missing.
+    command: sh -c "test -n \"$${MQTT_USERNAME}\" -a -n \"$${MQTT_PASSWORD}\" -a -n \"$${MQTT_DEVICE_PASSWORD}\" || { echo 'MQTT_USERNAME/MQTT_PASSWORD/MQTT_DEVICE_PASSWORD not set'; exit 1; }; touch /mosquitto/config/passwd && chmod 600 /mosquitto/config/passwd && chown mosquitto:mosquitto /mosquitto/config/passwd && mosquitto_passwd -b /mosquitto/config/passwd \"$${MQTT_USERNAME}\" \"$${MQTT_PASSWORD}\" && mosquitto_passwd -b /mosquitto/config/passwd \"kms-device\" \"$${MQTT_DEVICE_PASSWORD}\" && exec mosquitto -c /mosquitto/config/mosquitto.prod.conf"
+    volumes:
+      - ./mosquitto.prod.conf:/mosquitto/config/mosquitto.prod.conf:ro
+      - ./mosquitto.acl:/mosquitto/config/mosquitto.acl:ro
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-skss}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    # Published because the browser opens /ws/keys against it directly — the Next
+    # rewrite only covers /api and does not upgrade websockets.
+    ports:
+      - "8000:8000"
+    env_file:
+      - ./backend/.env
+    depends_on:
+      # The image runs `alembic upgrade head` before uvicorn, so it needs a
+      # Postgres that is accepting connections, not merely a started container.
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      mosquitto:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 40s
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        # Inlined into the browser bundle at build time. Must be the publicly
+        # reachable backend URL — the browser opens /ws/keys against it directly.
+        NEXT_PUBLIC_API_URL: ${PUBLIC_API_URL:?set PUBLIC_API_URL in .env, e.g. https://api.sntc.example.com}
+    ports:
+      - "3000:3000"
+    environment:
+      # Server-side rewrite target, resolved over the compose network.
+      INTERNAL_API_URL: http://backend:8000
+      # standalone server.js binds localhost without this, unreachable from outside.
+      HOSTNAME: "0.0.0.0"
+      PORT: "3000"
+      NODE_ENV: production
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  postgres_data:

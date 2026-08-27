@@ -1,0 +1,23 @@
+node_modules
+.next
+out
+build
+
+.git
+.gitignore
+
+# Never bake env values into an image layer. Compose supplies them at runtime.
+.env
+.env.*
+!.env.example
+
+Dockerfile
+.dockerignore
+README.md
+
+*.tsbuildinfo
+npm-debug.log*
+yarn-error.log*
+coverage
+.DS_Store
+.playwright-mcp

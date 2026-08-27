@@ -1,0 +1,254 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#101313">
+  <title>KMS // Cabinet access</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #101313;
+      --panel: #181d1d;
+      --line: #34403e;
+      --text: #e8eee9;
+      --muted: #9aa8a1;
+      --accent: #d8ff61;
+      --danger: #ff8f82;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100svh;
+      display: grid;
+      place-items: center;
+      padding: 24px;
+      background: var(--bg);
+      color: var(--text);
+      font: 16px/1.5 Arial, sans-serif;
+    }
+    main { width: min(100%, 420px); }
+    .eyebrow {
+      margin: 0 0 18px;
+      color: var(--accent);
+      font: 700 12px/1.2 monospace;
+      letter-spacing: .14em;
+      text-transform: uppercase;
+    }
+    h1 {
+      margin: 0;
+      font-size: clamp(2rem, 10vw, 3.2rem);
+      line-height: .98;
+      letter-spacing: -.06em;
+    }
+    .intro { margin: 16px 0 28px; color: var(--muted); }
+    form, .handoff {
+      padding: 20px;
+      border: 1px solid var(--line);
+      background: var(--panel);
+    }
+    label {
+      display: block;
+      margin-bottom: 8px;
+      color: var(--muted);
+      font: 700 12px/1.2 monospace;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+    .password-row { display: flex; gap: 8px; }
+    input, button, a { min-height: 52px; border-radius: 2px; font: inherit; }
+    input {
+      width: 100%;
+      padding: 0 14px;
+      border: 1px solid var(--line);
+      background: #0f1313;
+      color: var(--text);
+      outline: none;
+    }
+    input:focus { border-color: var(--accent); box-shadow: 0 0 0 2px #d8ff6133; }
+    button, a {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      border: 0;
+      padding: 0 18px;
+      font-weight: 700;
+      text-decoration: none;
+      cursor: pointer;
+    }
+    #toggle { flex: 0 0 auto; background: #293230; color: var(--text); }
+    #submit { width: 100%; margin-top: 16px; background: var(--accent); color: #101313; }
+    button:disabled { cursor: wait; opacity: .55; }
+    .message { min-height: 24px; margin: 12px 0 0; color: var(--danger); font-size: 14px; }
+    .handoff { margin-top: 16px; }
+    .handoff p { margin: 0 0 14px; color: var(--muted); font-size: 14px; }
+    #continue {
+      width: 100%;
+      background: #293230;
+      color: var(--muted);
+      pointer-events: none;
+      opacity: .55;
+    }
+    #continue.ready { background: var(--accent); color: #101313; pointer-events: auto; opacity: 1; }
+    .handoff ol { margin: 0 0 16px; padding-left: 22px; color: var(--text); font-size: 14px; }
+    .handoff li + li { margin-top: 8px; }
+    .code-panel {
+      margin-bottom: 16px;
+      padding: 20px;
+      border: 1px solid var(--accent);
+      background: var(--panel);
+      text-align: center;
+    }
+    .code-panel p { margin: 0; color: var(--muted); font-size: 13px; }
+    #code {
+      margin: 10px 0 6px;
+      font: 700 clamp(2.2rem, 16vw, 3.4rem)/1 monospace;
+      letter-spacing: .18em;
+      color: var(--accent);
+    }
+    #code.pending { color: var(--muted); letter-spacing: .08em; font-size: 1.1rem; }
+    .website-link {
+      display: block;
+      margin-top: 14px;
+      color: var(--accent);
+      font: 13px/1.4 monospace;
+      overflow-wrap: anywhere;
+    }
+    .foot { margin: 20px 0 0; color: var(--muted); font: 12px/1.4 monospace; }
+  </style>
+</head>
+<body>
+  <main>
+    <p class="eyebrow">KMS / cabinet gateway</p>
+    <h1>Your access code</h1>
+    <p class="intro">Write this down, then turn off ESP Wi‑Fi and enable mobile data or normal Wi‑Fi. You will enter it on the website.</p>
+
+    <section class="code-panel" aria-live="polite">
+      <p>Proximity code</p>
+      <div id="code" class="pending">Reading…</div>
+      <p id="code-note">Only readable at the cabinet.</p>
+    </section>
+
+    <section class="handoff" aria-live="polite">
+      <p id="handoff-copy">Opening KMS Operating after the network switch…</p>
+      <a id="continue" href="https://kms-opal.vercel.app/" target="_blank" rel="noopener noreferrer" aria-disabled="true" tabindex="-1">Continue to KMS Operating</a>
+      <a class="website-link" href="https://kms-opal.vercel.app/" target="_blank" rel="noopener">https://kms-opal.vercel.app/</a>
+    </section>
+
+    <p class="foot" id="network-status">Connected directly to KMS • ESP32 cabinet controller</p>
+  </main>
+  <script>
+    const continueLink = document.querySelector('#continue');
+    const handoffCopy = document.querySelector('#handoff-copy');
+    const networkStatus = document.querySelector('#network-status');
+    const websiteLink = document.querySelector('.website-link');
+    const codeEl = document.querySelector('#code');
+    const codeNote = document.querySelector('#code-note');
+
+    const localHosts = ['192.168.4.1'];
+    const isLocalEsp = localHosts.includes(window.location.hostname) ||
+      window.location.hostname.startsWith('192.168.') ||
+      window.location.hostname.startsWith('10.') ||
+      window.location.hostname.startsWith('172.');
+
+    window.KMS = {
+      local: isLocalEsp,
+      host: window.location.hostname || '192.168.4.1',
+      baseUrl: window.location.origin
+    };
+
+    async function loadPortalConfig() {
+      try {
+        const response = await fetch('/api/portal-config', { cache: 'no-store' });
+        const body = await response.json();
+        if (!body.website_url) return;
+        continueLink.href = body.website_url;
+        websiteLink.href = body.website_url;
+        websiteLink.textContent = body.website_url;
+        window.KMS.websiteUrl = body.website_url;
+      } catch (_) {
+        window.KMS.websiteUrl = continueLink.href;
+      }
+    }
+
+    function updateNetworkStatus() {
+      networkStatus.textContent = isLocalEsp
+        ? 'Connected directly to KMS • ESP32 cabinet controller'
+        : 'Connected • ESP32 cabinet controller';
+    }
+
+    window.addEventListener('online', updateNetworkStatus);
+    window.addEventListener('offline', updateNetworkStatus);
+    updateNetworkStatus();
+
+    async function loadProximityCode(token) {
+      try {
+        const response = await fetch('/api/proximity-code', {
+          cache: 'no-store',
+          headers: { 'X-Session-Token': token }
+        });
+        const body = await response.json();
+        if (!response.ok || !body.code) throw new Error(body.error || 'no code');
+        // A code the cabinet never published cannot be redeemed — the website
+        // would only answer "proximity code invalid". Name the real fault here.
+        if (!body.online) {
+          codeEl.textContent = 'Offline';
+          codeNote.textContent = 'Cabinet has no internet yet, so this code would be rejected. Wait a moment and reload.';
+          return null;
+        }
+        codeEl.textContent = body.code;
+        codeEl.classList.remove('pending');
+        // Read the remaining life off the response rather than restating
+        // CODE_ROTATE_MS here — a second copy of the number silently goes stale
+        // the day the firmware constant changes.
+        if (body.rotates_in_ms > 0) {
+          const mins = Math.ceil(body.rotates_in_ms / 60000);
+          codeNote.textContent = `Only readable at the cabinet. New code in ~${mins} min.`;
+        }
+        return body.code;
+      } catch (_) {
+        codeEl.textContent = 'Unavailable';
+        codeNote.textContent = 'Could not read the code. Reload this page.';
+        return null;
+      }
+    }
+
+    async function startLocalSession() {
+      try {
+        const response = await fetch('/api/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: '{}'
+        });
+        const body = await response.json().catch(() => ({}));
+        if (!response.ok || !body.token) throw new Error(body.error || 'Login failed');
+        sessionStorage.setItem('kms_esp_session', body.token);
+        const code = await loadProximityCode(body.token);
+        // No usable code means no point sending the phone off the AP.
+        if (!code) return;
+        await loadPortalConfig();
+        const destination = window.KMS.websiteUrl || continueLink.href;
+        handoffCopy.textContent = 'Opening KMS Operating…';
+        continueLink.href = destination;
+        // Detach from the ESP before the user changes networks. A page served
+        // from 192.168.4.1 dies as soon as that Wi-Fi is disconnected, so the
+        // handoff itself must not be hosted by the ESP. The code rides along in
+        // the data: URL for the same reason — it has to outlive the AP.
+        const escapedDestination = JSON.stringify(destination).replace(/</g, '\\u003c');
+        const escapedCode = JSON.stringify(code || '').replace(/</g, '\\u003c');
+        const closeScript = '<' + '/script>';
+        const handoffHtml = `<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>Connecting to KMS</title><style>body{font:16px system-ui,sans-serif;background:#101313;color:#e8eee9;padding:32px;line-height:1.5}main{max-width:420px;margin:auto}a{color:#d8ff61}p{color:#9aa8a1}#c{font:700 2.6rem/1 monospace;letter-spacing:.18em;color:#d8ff61;margin:12px 0}</style><main><h1>Your access code</h1><div id="c"></div><p>Enter this on the website. Turn off ESP Wi‑Fi and enable mobile data or normal Wi‑Fi.</p><p id="state">Waiting for internet…</p><p><a id="open" href=${escapedDestination} target="_blank" rel="noopener">Open KMS Operating</a></p></main><script>const target=${escapedDestination};document.getElementById('c').textContent=${escapedCode};const state=document.getElementById('state');async function connect(){try{await fetch(target,{mode:'no-cors',cache:'no-store'});state.textContent='Internet detected. Opening KMS Operating…';location.replace(target)}catch(e){state.textContent='Waiting for mobile data or normal Wi‑Fi…';setTimeout(connect,1000)}}connect()${closeScript}`;
+        window.location.replace('data:text/html;charset=utf-8,' + encodeURIComponent(handoffHtml));
+      } catch (error) {
+        handoffCopy.textContent = 'Could not open KMS Operating. Tap the link below.';
+        continueLink.classList.add('ready');
+        continueLink.removeAttribute('aria-disabled');
+        continueLink.removeAttribute('tabindex');
+      }
+    }
+
+    loadPortalConfig();
+    startLocalSession();
+  </script>
+</body>
+</html>

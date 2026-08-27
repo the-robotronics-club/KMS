@@ -1,0 +1,25 @@
+# Role ACLs for the production broker. Patterns only — no credentials here.
+#
+# Ceiling: every enclosure shares the kms-device password, so one compromised
+# device can spoof another's topics. Per-device credentials are the fix; the
+# firmware reads MQTT_USERNAME/MQTT_PASSWORD from config.h, so nothing in the
+# .ino changes — only provisioning.
+
+user kms-backend
+topic write device/+/access/command
+topic write device/+/rack/command
+topic read device/+/access/proximity_code
+topic read device/+/access/event
+topic read device/+/access/tamper_event
+topic read device/+/rack/event
+topic read device/+/power/telemetry
+topic read device/+/+/heartbeat
+
+user kms-device
+topic write device/+/access/proximity_code
+topic write device/+/access/event
+topic write device/+/access/tamper_event
+topic write device/+/power/telemetry
+topic write device/+/esp32/heartbeat
+topic read device/+/access/command
+topic read device/+/rack/command

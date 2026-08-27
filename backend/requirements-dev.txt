@@ -1,0 +1,7 @@
+# Test-only dependencies. Kept out of requirements.txt so the production image
+# does not ship a test framework.
+-r requirements.txt
+
+pytest==8.2.0
+pytest-asyncio==0.23.6
+pytest-httpx==0.30.0

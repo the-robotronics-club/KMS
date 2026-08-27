@@ -1,0 +1,56 @@
+# env
+.env
+.env.*
+!.env.example
+backend/.env
+frontend/.env.local
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# node / next
+node_modules/
+.next/
+out/
+*.tsbuildinfo
+
+# stale Cloudflare build output — the adapter is gone, these dirs are leftovers
+# from before the switch to Vercel. Safe to rm -rf frontend/.open-next .wrangler.
+.open-next/
+.wrangler/
+
+# agent tooling
+*.pdf
+.agents/
+.claude/
+.playwright-mcp/
+skills-lock.json
+
+# design/docs notes — repo carries only deployment-required files
+docs/
+
+# vercel
+.vercel/
+
+# build / os
+dist/
+build/
+.DS_Store
+*.log
+
+# ops helpers + tests stay local
+backend/scripts/
+backend/tests/
+.pio/
+.vscode/
+
+# firmware credentials — config.h picks these up via __has_include
+firmware/*/secrets.h
+graphify-out/

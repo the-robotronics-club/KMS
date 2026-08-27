@@ -1,0 +1,27 @@
+__pycache__/
+*.py[cod]
+*$py.class
+
+.venv
+venv/
+env/
+
+.git
+.gitignore
+
+# backend/.env holds DB, Redis, MQTT and SMTP credentials. `COPY . .` would bake
+# them into a readable image layer. Compose supplies them via env_file at runtime.
+.env
+.env.*
+!.env.example
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+Dockerfile
+.dockerignore
+*.md
+.DS_Store

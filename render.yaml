@@ -1,0 +1,53 @@
+# Render blueprint — https://render.com/docs/blueprint-spec
+#
+# One Docker web service. Postgres and Redis are external (Neon and Upstash),
+# so they are not declared here; their URLs arrive as environment variables.
+services:
+  - type: web
+    name: sntc-kms-api
+    runtime: docker
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    plan: free
+    region: singapore
+    healthCheckPath: /health
+    # The scheduler and (when enabled) the MQTT listener run in-process, and the
+    # Dockerfile runs `alembic upgrade head` on boot. More than one instance
+    # would duplicate every scheduled notification and race the migration.
+    numInstances: 1
+    envVars:
+      # sync: false = Render prompts on first deploy and stores the value in its
+      # own encrypted store. Nothing secret is committed here.
+      - key: DATABASE_URL
+        sync: false
+      - key: REDIS_URL
+        sync: false
+      - key: ALLOWED_ORIGINS
+        sync: false
+      - key: EMAIL_ADDRESS
+        sync: false
+      - key: EMAIL_APP_PASSWORD
+        sync: false
+      - key: DEBUG
+        value: "false"
+      - key: EMAIL_PROVIDER
+        value: smtp
+      - key: SMTP_SERVER
+        value: smtp.gmail.com
+      - key: SMTP_PORT
+        value: "587"
+      # HiveMQ Cloud. Host is not secret; the credential pair is, so it comes in
+      # through Render's encrypted store. Give the backend its own broker
+      # credential, separate from the cabinet's, so either can be revoked alone.
+      - key: MQTT_ENABLED
+        value: "true"
+      - key: MQTT_PORT
+        value: "8883"
+      - key: MQTT_TLS
+        value: "true"
+      - key: MQTT_HOST
+        sync: false
+      - key: MQTT_USERNAME
+        sync: false
+      - key: MQTT_PASSWORD
+        sync: false
