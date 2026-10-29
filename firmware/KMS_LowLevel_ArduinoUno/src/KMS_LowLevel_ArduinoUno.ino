@@ -1,3 +1,5 @@
+#include <Arduino.h>
+
 /*
  * ==========================================================================
  *  KMS Low-Level Controller - Arduino Uno Port
@@ -30,7 +32,7 @@
 //     Wiring: PUL-/DIR- -> GND, PUL+/DIR+ -> GPIOs
 //     Signals are ACTIVE-HIGH (GPIO HIGH triggers optocoupler)
 #define STEPPER_STEP_PIN 6          // -> PUL+
-#define STEPPER_DIR_PIN 7           // -> DIR+
+#define STEPPER_DIR_PIN 8         // -> DIR+
 #define STEPPER_PINS_INVERTED false // common ground = normal logic
 #define STEPPER_MAX_SPEED 4000.0    // steps/sec (AccelStepper AVR limit ~4000)
 #define STEPPER_ACCELERATION 500.0  // steps/sec^2
@@ -66,7 +68,7 @@
 //     at all. Nothing is measured in that mode — park the rack at slot 1 by
 //     hand before power-up, and expect the numbering to drift after any reset.
 //     Set it back to 1 the moment a switch exists.
-#define HOME_SWITCH_FITTED 0
+#define HOME_SWITCH_FITTED 1
 #define HOME_SWITCH_PIN 5
 #define HOME_SWITCH_ACTIVE_STATE LOW
 #define HOME_SEEK_SPEED 800.0 // steps/sec, slower than normal moves for a clean stop
@@ -129,6 +131,8 @@ public:
     // Set minimum pulse width for TB6600 (needs >=2.5us)
     motor.setMinPulseWidth(5);
 
+    // Explicitly set DIR pin mode as a safeguard
+    pinMode(STEPPER_DIR_PIN, OUTPUT);
     pinMode(HOME_SWITCH_PIN, INPUT_PULLUP);
   }
 
@@ -192,8 +196,31 @@ public:
     motor.moveTo(steps);
   }
 
-  // Move to key slot `slot` (1-based). Absolute, like every other move here.
-  void moveToSlot(int slot) { motor.moveTo(slotToSteps(slot)); }
+  // Move to key slot `slot` (1-based). 
+  // Modified to use Shortest Path Rotary Logic.
+  void moveToSlot(int slot) { 
+    long targetStepsInRev = slotToSteps(slot); 
+    long currentPos = motor.currentPosition();
+
+    // Standardize current position within 0 to STEPS_PER_REV-1
+    long currentPosInRev = currentPos % STEPS_PER_REV;
+    if (currentPosInRev < 0) {
+      currentPosInRev += STEPS_PER_REV;
+    }
+
+    // Calculate the shortest path to the target slot
+    long diff = targetStepsInRev - currentPosInRev;
+
+    // Adjust diff to take the shortest route around the circle (bidirectional)
+    if (diff > STEPS_PER_REV / 2) {
+      diff -= STEPS_PER_REV; // Faster to go backward
+    } else if (diff < -(STEPS_PER_REV / 2)) {
+      diff += STEPS_PER_REV; // Faster to go forward
+    }
+
+    // Apply the optimized shortest-path movement
+    motor.moveTo(currentPos + diff); 
+  }
 
   // The arithmetic itself is in rack_geometry.h so the host test can reach it.
   static long slotToSteps(int slot) { return rack_slot_to_steps(slot); }
