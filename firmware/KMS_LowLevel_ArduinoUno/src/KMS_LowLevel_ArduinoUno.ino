@@ -30,7 +30,7 @@
 //     Wiring: PUL-/DIR- -> GND, PUL+/DIR+ -> GPIOs
 //     Signals are ACTIVE-HIGH (GPIO HIGH triggers optocoupler)
 #define STEPPER_STEP_PIN 6          // -> PUL+
-#define STEPPER_DIR_PIN 7           // -> DIR+
+#define STEPPER_DIR_PIN 8          // -> DIR+
 #define STEPPER_PINS_INVERTED false // common ground = normal logic
 #define STEPPER_MAX_SPEED 4000.0    // steps/sec (AccelStepper AVR limit ~4000)
 #define STEPPER_ACCELERATION 500.0  // steps/sec^2
@@ -66,7 +66,7 @@
 //     at all. Nothing is measured in that mode — park the rack at slot 1 by
 //     hand before power-up, and expect the numbering to drift after any reset.
 //     Set it back to 1 the moment a switch exists.
-#define HOME_SWITCH_FITTED 0
+#define HOME_SWITCH_FITTED 1
 #define HOME_SWITCH_PIN 5
 #define HOME_SWITCH_ACTIVE_STATE LOW
 #define HOME_SEEK_SPEED 800.0 // steps/sec, slower than normal moves for a clean stop
